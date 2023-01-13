@@ -7,7 +7,9 @@ A quantity of interest in clinical studies is the absolute risk of an event give
 ## MSc Project Work
 
 My final code script can be found [here](https://github.com/trevorkwan/Penalized-Casebase-in-Survival-Analysis-MSc-Project-/blob/main/R/final_code_casebase_sim_study.Rmd).
+
 My final project report can be found [here](https://github.com/trevorkwan/Penalized-Casebase-in-Survival-Analysis-MSc-Project-/blob/main/reports/Final_MSc_Final_Project_Report_Trevor.pdf).
+
 My final presentation slides can be found [here](https://github.com/trevorkwan/Penalized-Casebase-in-Survival-Analysis-MSc-Project-/blob/main/presentations/Final_MSc_Final_Presentation_Trevor.pdf).
 
 ## Team Contact
