@@ -1,0 +1,1163 @@
+---
+title: "draft_10_casebase_sim_study"
+author: "Trevor Kwan"
+date: "13/07/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(casebase)
+library(dotwhisker)
+library(tidyr)
+library(broom)
+library(dplyr)
+library(survival)
+library(glmnet)
+library(ncvreg)
+library(stringr)
+library(lubridate)
+library(knitr)
+library(riskRegression)
+library(visreg)
+library(c060)
+```
+
+## Generate Data
+
+- n is # of observation rows
+- p is # of predictors
+- $\rho$ is the fixed pairwise correlation between any two predictors X_i, X_j
+- snr is signal-to-noise ratio
+
+We generated standard Gaussian predictor data, $X$, with $n$ observations and $p$ predictors. We fixed the pairwise correlation between any 2 predictors $X_i$ and $X_j$ at $\rho$, for several values of $\rho$.
+
+$\rho$ is able to fix the correlation between predictors because a larger rho means a larger value is multiplied to the identical columns first (identical columns have corr = 1). When the identical columns later have a standard normal rnorm() added to them, if they are already large values, then they will be resistant to the small addition rnorm() change = more correlated. If they are smaller values, they will be affected a lot by the small addition rnorm() change = less correlated.
+
+We then generated "true" survival times, $Y$, based on $Y = e^{\sum_{j=1}^{p} X_j\beta_j + k*Z}$, where $\beta_j = (-1)^j*e^{-2(j-1)/20}$, $Z \sim N(0,1)$, and $k$ is chosen based on our desired signal-to-noise ratio.
+
+We generated censored times through $C = e^{k*Z}$. The recorded survival time ("d.time") was the minimum of the "true" survival time and censoring time, $T = min{Y, C}$. If the censoring time preceeded the "true" survival time, $C < Y$, the observation was said to be censored.
+
+Regularization Paths for Cox’s Proportional Hazards Model via Coordinate Descent (2011).
+
+```{r}
+n = 500
+p = 120
+rho = 0.5
+snr = 3
+z = 100
+wb = 1 # formula to weight the betas, the larger the wb, the larger the betas
+```
+
+```{r}
+set.seed(123)
+
+# function to generate x
+gen.x = function(n,p,rho){
+ if(abs(rho)<1){
+  beta=sqrt(rho/(1-rho))
+ x0=matrix(rnorm(n*p),ncol=p) # x0 dim is n*p, standard normal (mean = 0, sd = 1) values
+ z=rnorm(n)
+ x=beta*matrix(z,nrow=n,ncol=p,byrow=F)+x0
+ }
+ if(abs(rho)==1){ x=matrix(z,nrow=n,ncol=p,byrow=F)}
+return(x)
+}
+
+# function to generate survival times (introduce sparsity into Beta's)
+# z is the number of Beta's you want to artificially set to 0
+# p is the total number of Betas/predictors
+gen.times = function(x,snr,z){
+n=nrow(x)
+p=ncol(x)
+b=((-1)^(1:p))*exp(-2*( (1:p)-wb)/20)
+b[(p-z):p] <- 0
+f=x%*%b # x dim is n*p, b dim is p*1, f dim is n*1
+e=rnorm(n) # e dim is n*1
+k=sqrt(var(f)/(snr*var(e))) # k dim is 1*1, singular value since var of a bunch of numbers is one value
+y=exp(f+k*e) # f dim is n*1, k dim is 1*1, e dim is n*1, y dim is n*1
+return(y)
+}
+
+
+# function to generate censoring times
+gen.times.censor = function(x,snr,z){
+n=nrow(x)
+p=ncol(x)
+b=((-1)^(1:p))*exp(-2*( (1:p)-wb)/20)
+b[(p-z):p] <- 0
+f=x%*%b
+e=rnorm(n)
+k=sqrt(var(f)/(snr*var(e)))
+y=exp(k*e)
+return(y)
+}
+
+### testing representation of how rho fixes pairwise correlation
+# correlation <- function(x1, x2){
+#   sum((x1-mean(x1))*(x2-mean(x2))) / (sqrt(sum((x1-mean(x1))^2) * sum((x2 - mean(x2))^2 )))
+# }
+# 
+# x1 <- 1000*c(1,2,3,4,5) + rnorm(5)
+# x2 <- 1000*c(1,2,3,4,5) + rnorm(5)
+# correlation(x1, x2)
+# 
+# x3 <- 1*c(1,2,3,4,5) + rnorm(5)
+# x4 <- 1*c(1,2,3,4,5) + rnorm(5)
+# correlation(x3, x4)
+
+```
+
+```{r}
+set.seed(123)
+
+# generate X's
+x_df <- gen.x(n = n, p = p, rho = rho) %>% as.data.frame()
+
+# generate true survival times
+surv_times <- gen.times(x = as.matrix(x_df), snr = snr, z = z)
+
+# generate censoring times
+cens_times <- gen.times.censor(x = as.matrix(x_df), snr = snr, z = z)
+
+# generate survival/censoring times
+y_mat <- cbind(surv_times, cens_times)
+d.time <- apply(y_mat, MARGIN = 1, FUN = min)
+
+# generate censoring status (death)
+death <- ifelse(cens_times <= surv_times, yes = 0, no = 1)
+
+# combine generated data
+df <- cbind(death, d.time, x_df)
+
+# split into train and test: 80% train and 20% test
+train_indices <- sample(x = nrow(df), size = 0.80*nrow(df)) # randomly sample 80% of observations
+test_indices <- setdiff(x = 1:nrow(df), y = train_indices) # get the remaining 20% of observations
+
+train_df <- df[train_indices,]
+test_df <- df[test_indices,]
+```
+
+```{r}
+# train and test data wrangling
+
+# train data
+x_train <- model.matrix(~ . -death -d.time, data = train_df)[, -1] # turns characters into numbers 
+y_train <- train_df %>% 
+  select(death, d.time) %>%
+  data.matrix()
+
+y_train_2 <- with(data = y_train %>% as.data.frame(), expr = Surv(time = d.time, event = death)) # get times and censor status from train_df
+# plus/0 is censored
+
+# test data
+x_test <- model.matrix(~ . -death -d.time, data = test_df)[, -1]
+y_test <- test_df %>% 
+  select(death, d.time) %>%
+  data.matrix()
+
+y_test_2 <- with(data = y_test %>% as.data.frame(), expr = Surv(time = d.time, event = death))
+
+test_df_model <- cbind(y_test, x_test) %>% as.data.frame()
+
+kable(head(df)[,1:7], caption = "The Generated Data")
+
+# show the true Beta's
+b=((-1)^(1:p))*exp(-2*( (1:p)-wb)/20)
+b[(p-z):p] <- 0
+beta_df <- as.data.frame(round(t(b), 3))
+colnames(beta_df) <- c(paste0("B", 1:p))
+kable(beta_df, caption = "The Betas")
+```
+
+
+```{r}
+# ratio of survival and censored
+num_cens <- count(df, death == 0)[2, 2]
+num_fail <- count(df, death == 0)[1,2]
+
+num_cens_fail <- as.data.frame(data.frame(num_cens, num_fail) %>% t())
+colnames(num_cens_fail) <- c("Number Observation Rows")
+rownames(num_cens_fail) <- c("Censored", "Failure")
+
+kable(num_cens_fail, caption = "Ratio of Censored and Failure")
+```
+
+# Run Methods
+
+(1) The unpenalized Cox method finds the $\beta$ coefficients that maximizes the likelihood function $L$. 
+$L$ is a partial likelihood because it does not consider probabilities for subjects who are censored and it is based on the observed order of events.
+$L = L_1 * L_2 * \dots * L_k = \prod_{f=1}^{k}L_f$
+$L_f$ measures the hazard of the patient at that time / all subjects at risk at that time. Thus, the baseline hazards will cancel out and we solve for the $\beta's$ that will maximize the product of the $L_f$'s.
+
+(see page 127 of the Kleinbaum book for a worked example.)
+
+Maximizing the log likelihood = minimizing the negative log likelihood.
+
+(2) The elastic net penalized Cox method finds the $\beta$ coefficients that minimizes $\frac{1}{N} * \sum_{i=1}^{N}w_i*l(y_i, \beta_0 + \beta^Tx_i) + \lambda[(1-\alpha)|\beta_2^2|/2+ \alpha|\beta_1|]$.
+
+$l(y_i, \beta_0 + \beta^Tx_i)$ is the negative log likelihood contribution for observation $i$
+
+The elastic net penalty is controlled by $\alpha$, which bridges the gap between lasso ($\alpha = 1$) and ridge ($\alpha = 0$).
+
+The tuning parameter $\lambda$ controls the "strength" or "level" of the penalty.
+
+$w_i$ is for the observation weights, and the default is 1 for each observation.
+
+(3) Casebase is a framework for estimating fully parametric hazard models through logistic regression.
+
+The purpose of the casebase package is to provide practitioners with an easy-to-use software tool to compute a patient's risk (or cumulative incidence) of an event, conditional on a particular patient's covariate profile.
+
+Casebase compares person-moments when the event of interest occurred with person-moments when patients were at risk.
+
+Logistic regression also allows us to perform variable selection within the casebase framework.
+
+```{r}
+# fit models
+
+# (1) unpen_cox method
+unpen_cox <- coxph(Surv(time = d.time, event = death) ~ ., data = train_df, x = TRUE) # x = TRUE means matrix can be returned in cox_method$x
+
+unpen_cox$coefficients[which(is.na(unpen_cox$coefficients))] <- 0 # set NA coef to 0 for brier score later
+
+# (2) pen_cox method (lasso)
+lasso_pen_cox <- cv.glmnet(x = x_train, y = y_train_2, family = "cox", alpha = 1, type.measure = "deviance") # cv does cross validation, in this case it tells you the lambda/model that minimizes the partial likelihood as specified by type.measure = "deviance"
+# but the default lambda value is 1SE lambda, must specify lambda.min
+
+# the two dotted lines represent the log of the (1) min lambda and (2) 1 standard error lambda
+plot(lasso_pen_cox, type.measure = "deviance")
+
+# (2) pen_cox method (ridge)
+ridge_pen_cox <- cv.glmnet(x = x_train, y = y_train_2, family = "cox", alpha = 0, type.measure = "deviance") # cv does cross validation, in this case it tells you the lambda/model that minimizes the partial likelihood as specified by type.measure = "deviance"
+
+# (3) pen_cb method (lasso cb)
+lasso_pen_cb <- fitSmoothHazard.fit(x = x_train, y = y_train,
+                    family = "glmnet",
+                    time = "d.time",
+                    event = "death",
+                    formula_time = ~ log(d.time), # how hazard depends on time
+                    alpha = 1, # lasso
+                    ratio = 10, # for each element in your case series, you have this many in your base series
+                    standardize = TRUE,
+                    penalty.factor = c(0, rep(1, ncol(x_train))) #0 and then number of 1's is number of columns in x
+                    )
+
+# (4) pen_cb method (ridge cb)
+ridge_pen_cb <- fitSmoothHazard.fit(x = x_train, y = y_train,
+                    family = "glmnet",
+                    time = "d.time",
+                    event = "death",
+                    formula_time = ~ log(d.time), # how hazard depends on time
+                    alpha = 0, # ridge
+                    ratio = 10, # ratio of size of base series to case series
+                    standardize = TRUE,
+                    penalty.factor = c(0, rep(1, ncol(x_train))) #0 and then number of 1's is number of columns in x
+                    )
+
+## testing the link function for logistic regression (visual representation)
+# x = seq(from  = 0.01, to = 1, by = 0.01)
+# plot(y = log(x/(1-x)), x = x)
+
+## testing to view the casebase series dataframe
+# cbSeries <- sampleCaseBase(data = as.data.frame(cbind(y_train, x_train)), time = "d.time", event = "death")
+# sampleData <- cbSeries
+# sample_event <- as.matrix(sampleData[, "death"]) # get the death col of 0s and 1s from cbSeries
+# sample_time <- model.matrix(update(~ log(d.time), ~ . -1), sampleData) # output a column that is the log of d.time in sampleData (only do this if the family = "glmnet" or "gbm") # else, model.matrix(~ log(d.time), sampleData)
+# sample_time_x <- cbind(sample_time,
+#                        as.matrix(sampleData[, !names(sampleData) %in% c("death", "d.time", "offset")])) # get all the X col and add log(d.time) col
+# sample_offset <- sampleData$offset
+
+# what cbSeries looks like before putting it in a logistic regression
+# as.data.frame(cbind(sample_event, sample_time_x))
+```
+
+# Variable Selection Comparison
+
+True positive: A test result that correctly indicates the presence of a condition or characteristic.
+True negative: A test result that correctly indicates the absence of a condition or characteristic.
+False positive: A test result which wrongly indicates that a particular condition or attribute is present.
+False negative: A test result which wrongly indicates that a particular condition or attribute is absent.
+
+```{r}
+# positive = non-zero, negative  = zero
+# the higher the TPR and TNR the better, the lowest the FPR and FNR the better
+# the range of MCC is from -1 to +1, the higher the MCC the better
+
+# lasso penalized cox variable selection
+lasso_cox_vs <- !(as.vector(coefficients(lasso_pen_cox, s = "lambda.min")) == 0) # TRUE if non-zero, FALSE if zero
+
+# true positive (TP), true negative (TN), false positive (FP), false negative (FN)
+tp = sum(lasso_cox_vs[1:(p-z)])
+tn = sum(!lasso_cox_vs[(p-z+1):p])
+fp = z - tn
+fn = (p-z)-tp
+
+# true positive rate: TPR = TP/P = TP/(TP+FN) (sensitivity)
+tpr_cox = tp/(tp+fn)
+
+# true negative rate: TNR = TN/N = TN/(TN+FP) (specificity)
+tnr_cox = tn/(tn+fp)
+
+# false positive rate: (1-TNR)
+fpr_cox = 1-tnr_cox
+
+# false negative rate: (1-TPR)
+fnr_cox = 1-tpr_cox
+
+# matthew's correlation coefficient (MCC) (TP*TN-FP*FN)/(sqrt((TP+FP)(TP+FN)(TN+FP)(TN+FN)))
+mcc_cox = ((tp*tn) - (fp*fn)) / sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn))
+
+# lasso penalized casebase variable selection
+lasso_cb_vs <- !(as.vector(coefficients(lasso_pen_cb, s = "lambda.min")) == 0)
+
+# true positive (TP), true negative (TN), false positive (FP), false negative (FN)
+tp = sum(lasso_cb_vs[1:(p-z)])
+tn = sum(!lasso_cb_vs[(p-z+1):p])
+fp = z - tn
+fn = (p-z)-tp
+
+# true positive rate: TPR = TP/P = TP/(TP+FN) (sensitivity)
+tpr_cb = tp/(tp+fn)
+
+# true negative rate: TNR = TN/N = TN/(TN+FP) (specificity)
+tnr_cb = tn/(tn+fp)
+
+# false positive rate: (1-TNR)
+fpr_cb = 1-tnr_cb
+
+# false negative rate: (1-TPR)
+fnr_cb = 1-tpr_cb
+
+# matthew's correlation coefficient (MCC) (TP*TN-FP*FN)/(sqrt((TP+FP)(TP+FN)(TN+FP)(TN+FN)))
+mcc_cb = ((tp*tn) - (fp*fn)) / sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn))
+
+# variable selection comparison table
+metric_vs <- c("Matthew's Correlation Coefficient (MCC)", "True Positive Rate (TPR)", "True Negative Rate (TNR)", "False Positive Rate (FPR)", "False Negative Rate (FNR)")
+method_vs <- c("Lasso Cox", "Lasso Casebase")
+values_vs <- round(c(mcc_cox, mcc_cb, tpr_cox, tpr_cb, tnr_cox, tnr_cb, fpr_cox, fpr_cb, fnr_cox, fnr_cb), 3)
+vs_df <- matrix(values_vs, ncol = 2, byrow = TRUE) %>% as.data.frame()
+colnames(vs_df) <- method_vs
+rownames(vs_df) <- metric_vs
+kable(vs_df, caption = "Variable Selection Comparison")
+
+df_show <- round(as.data.frame(cbind(as.vector(coefficients(lasso_pen_cox, s = "lambda.min")),as.vector(coefficients(lasso_pen_cb, s = "lambda.min")))),3)
+colnames(df_show) <- c("Lasso Cox Betas", "Lasso Casebase Betas")
+df_show
+```
+
+
+## Evaluate Metrics
+
+#### 1. Concordance (higher is better)
+Concordance is the fraction of all evaluable pairs where the model correctly predicts (using risk score) out of a pairs of individuals.
+
+How to determine if a pair is evaluable?
+
+```{r}
+input <- c("censored time", "failure time", "no",
+           "failure time", "censored time", "yes",
+           "failure time", "failure time", "yes",
+           "censored time", "censored time", "no")
+
+eval_df <- matrix(input, ncol = 3, byrow = TRUE) %>% 
+  as.data.frame()
+
+colnames(eval_df) <- c("Before", "After", "Evaluable?")
+
+kable(eval_df, caption = "Is the pair evaluable?")
+```
+
+Let $X_1$ and $X_2$ represent the risk scores for a given pair, and $T_1$ and $T_2$ the true survival times for a given pair.
+
+For each evaluable pairwise combination pair, there are only 4 possible cases:
+
+1. $X_1 > X_2$ and $T_1 < T_2$ OR $X_1 < X_2$ and $T_1 > T_2$: The pair is concordant (C).
+2. $X_1 > X_2$ and $T_1 > T_2$ OR $X_1 < X_2$ and $T_1 < T_2$: The pair is disconcordant (C).
+3. $X_1 == X_2$: The risk scores are equal (R).
+4. $T_1 == T_2$: The times are equal (T).
+
+The concordance index is:
+$$
+Concordance = \frac{C + \frac{R}{2}}{C + D + R}
+$$
+
+
+```{r}
+# (1) concordance (my function)
+
+# takes in a data frame with columns:
+# pred: a column of predicted risk scores from a fitted model using x_test
+# time: a column of the true survival time
+# status: a column of the true status (censored = 0 or failure = 1)
+
+conc <- function(df){
+  row.names(df) <- NULL
+  all_pairs <- combn(x = row.names(df), m = 2) %>% as.data.frame()
+  
+  # get evaluable pairs
+  eval <- rep(NA, ncol(all_pairs))
+  
+  for (i in 1:ncol(all_pairs)) {
+    x <- rbind(df[as.numeric(all_pairs[1,i]),],  df[as.numeric(all_pairs[2,i]),])
+    if (all(c(1, 1) == x$status)) {
+      eval[i] <- "E"
+    } else if ((all(c(0, 1) == x$status)) & (x$time[1] > x$time[2])) {
+      eval[i] <- "E"
+    } else if ((all(c(1, 0) == x$status)) & (x$time[1] < x$time[2])) {
+      eval[i] <- "E"
+    } else {
+      eval[i] <- "I"
+    }
+
+  }
+  
+  # get the class if pairs are evaluable
+  class <- rep(NA, ncol(all_pairs))
+  
+  for (i in 1:ncol(all_pairs)) {
+  x <- rbind(df[as.numeric(all_pairs[1,i]),],  df[as.numeric(all_pairs[2,i]),])
+  
+  if (eval[i] == "E"){
+    
+  if (((x$pred[1] > x$pred[2]) & (x$time[1] < x$time[2])) | ((x$pred[1] < x$pred[2]) & (x$time[1] > x$time[2]))) {
+    class[i] <- "C"
+  } else if (((x$pred[1] > x$pred[2]) & (x$time[1] > x$time[2])) | ((x$pred[1] < x$pred[2]) & (x$time[1] < x$time[2]))) {
+    class[i] <- "D"
+  } else if (x$pred[1] == x$pred[2]) {
+    class[i] <- "R"
+  } else if (x$time[1] == x$time[2]) {
+    class[i] <- "T"
+  }
+    
+  } else {
+    class[i] <- "I"
+  }
+  }
+  
+  # count the number of C's, D's, and R's and put in C-index formula
+  C <- str_count(class, "C") %>% sum()
+  D <- str_count(class, "D") %>% sum()
+  R <- str_count(class, "R") %>% sum()
+
+  concordance = (C+(R/2))/(C+D+R)
+  concordance
+}
+
+# test my function using unpen_cox
+# pred <- predict(unpen_cox, newdata = as.data.frame(x_test), type = "lp") 
+# y_testing <- cbind(y_test[,2], y_test[,1])
+# colnames(y_testing) <- c("time", "status")
+# 
+# df <- as.data.frame(cbind(pred, y_testing))
+# conc(df)
+```
+
+
+```{r}
+# # (1) concordance with my function
+# 
+# y_testing <- cbind(y_test[,2], y_test[,1])
+# colnames(y_testing) <- c("time", "status")
+# 
+# # unpen_cox concordance
+# unpen_cox_conc <- concordance(unpen_cox)$conc
+# # double check concordance function with this
+# pred <- predict(unpen_cox, newdata = as.data.frame(x_test), type = "lp") 
+# df <- as.data.frame(cbind(pred, y_testing))
+# unpen_cox_conc_2 <- conc(df)
+# 
+# # lasso_pen_cox concordance
+# pred <- predict(lasso_pen_cox, newx = x_test, s = "lambda.min") # default is type = link, gives the linear predictors for Cox models
+# df <- as.data.frame(cbind(pred, y_testing))
+# colnames(df) <- c("pred", "time", "status")
+# lasso_cox_conc <- conc(df)
+# 
+# # ridge_pen_cox concordance
+# pred <- predict(ridge_pen_cox, newx = x_test, s = "lambda.min")
+# df <- as.data.frame(cbind(pred, y_testing))
+# colnames(df) <- c("pred", "time", "status")
+# ridge_cox_conc <- conc(df)
+# 
+# # lasso_pen_cb concordance
+# x_test_cb <- cbind(log(y_test[,"d.time"]), x_test) # solution: add log(d.time) as a first column to x_test
+# pred <- predict(lasso_pen_cb, newx = x_test_cb, type = "response", s = "lambda.min") # for each subject, this gives the probability that y=1 (death = 1), probability of failure
+# df <- as.data.frame(cbind(pred, y_testing))
+# colnames(df) <- c("pred", "time", "status")
+# lasso_cb_conc <- conc(df)
+# 
+# # ridge_pen_cb concordance
+# x_test_cb <- cbind(log(y_test[,"d.time"]), x_test) # solution: add log(d.time) as a first column to x_test
+# pred <- predict(ridge_pen_cb, newx = x_test_cb, type = "response", s = "lambda.min") # for each subject, this gives the probability that y=1 (death = 1), probability of failure
+# df <- as.data.frame(cbind(pred, y_testing))
+# colnames(df) <- c("pred", "time", "status")
+# ridge_cb_conc <- conc(df)
+# 
+# conc_values <- round(rbind(unpen_cox_conc_2, lasso_cox_conc, ridge_cox_conc, lasso_cb_conc, ridge_cb_conc), 4)
+# 
+# method_names <- c("Unpenalized Cox", "Lasso Penalized Cox", "Ridge Penalized Cox", "Lasso Penalized Casebase", "Ridge Penalized Casebase")
+# conc_table <- as.data.frame(cbind(method_names, conc_values))
+# rownames(conc_table) <- NULL
+# colnames(conc_table) <- c("Method", "Concordance")
+# 
+# kable(conc_table, caption = "Concordance Table")
+```
+
+```{r}
+# (1) concordance (C-index method)
+y_testing <- cbind(y_test[,2], y_test[,1])
+colnames(y_testing) <- c("time", "status")
+
+# unpen_cox concordance
+pred <- predict(unpen_cox, newdata = as.data.frame(x_test), type = "lp") 
+unpen_cox_conc <- Cindex(pred = pred, y = y_testing)
+
+# lasso_pen_cox concordance
+pred <- predict(lasso_pen_cox, newx = x_test, s = "lambda.min")
+lasso_cox_conc <- Cindex(pred = pred, y = y_testing)
+
+# ridge_pen_cox concordance
+pred <- predict(ridge_pen_cox, newx = x_test, s = "lambda.min")
+ridge_cox_conc <- Cindex(pred = pred, y = y_testing)
+
+# lasso_pen_cb concordance
+x_test_cb <- cbind(log(y_test[,"d.time"]), x_test) # solution: add log(d.time) as a first column to x_test
+pred <- predict(lasso_pen_cb, newx = x_test_cb, type = "response", s = "lambda.min") # for each subject, this gives the probability that y=1 (death = 1), probability of failure
+lasso_cb_conc <- Cindex(pred = pred, y = y_testing)
+
+# ridge_pen_cb concordance
+x_test_cb <- cbind(log(y_test[,"d.time"]), x_test) # solution: add log(d.time) as a first column to x_test
+pred <- predict(ridge_pen_cb, newx = x_test_cb, type = "response", s = "lambda.min") # for each subject, this gives the probability that y=1 (death = 1), probability of failure
+ridge_cb_conc <- Cindex(pred = pred, y = y_testing)
+
+conc_values <- round(rbind(unpen_cox_conc, lasso_cox_conc, ridge_cox_conc, lasso_cb_conc, ridge_cb_conc), 4)
+
+method_names <- c("Unpenalized Cox", "Lasso Penalized Cox", "Ridge Penalized Cox", "Lasso Penalized Casebase", "Ridge Penalized Casebase")
+conc_table <- as.data.frame(cbind(method_names, conc_values))
+rownames(conc_table) <- NULL
+colnames(conc_table) <- c("Method", "Concordance")
+
+kable(conc_table, caption = "Concordance Table")
+```
+
+#### 2. Time-Dependent Brier Scores (lower is better)
+
+The Time-Dependent Brier Scores are computed as $BS(t) = \sum_i\{\frac{I(C_i \ge min(T_i, t))}{\hat{G(min(T_i, t))}}\} \{ I(T_i \le t) - \hat{F}(t|x_i) \}^2$, where $T_i$ represents the event time for observation $i$, $t$ represents the specified time $t$ being evaluated, and $C_i$ represents the censoring indicator or status.
+
+$I(C_i \ge min(T_i, t))$ is an indicator function that evaluates to 0 if the observation is censored and survival time is less than $t$, and evaluates to 1 otherwise.
+
+$\hat{G(min(T_i, t))}$ gives the Kaplan-Meier estimate of the probability of survival for the minimum of the event time and $t$.
+
+$I(T_i \le t)$ is an indicator function that evaluates to 1 if the event time is less than or equal to $t$.
+
+$\hat{F}(t|x_i)$ gives the probability of failure given observation $i$ with covariates $x_i$ at time $t$.
+
+Regularized Regression for Two Phase Failure Time Studies (2021).
+
+```{r}
+# # get Brier Score (my method)
+# 
+# # get_brier_scores function
+# get_brier_scores <- function(data, pred) {
+#   # set seq of times you want to loop over
+#   times <- seq(from = 0,
+#                to  = max(data$d.time),
+#                length = length(data$d.time))
+#   
+#   # for each time t, we want a single brier score, summed of the individuals
+#   BS_list <- rep(NA, length(times))
+#   
+#   for (x in 1:length(times)) {
+#     t <- times[x]
+#     
+#     # get the min(d.time, t) of all individuals for a given time t
+#     min1 <- sapply(
+#       X = data$d.time,
+#       FUN = function(x) {
+#         min(x, t)
+#       }
+#     )
+#     
+#     # get the ind_Ci for all individuals for a given time t
+#     ind_Ci <- rep(NA, nrow(data)) # initialize empty vector
+#     
+#     for (i in 1:nrow(data)) {
+#       if ((data$death[i] == 0 & (data$d.time[i] < t)) | (data$death[i] == 1)) {
+#         ind_Ci[i] = 1
+#       } else {
+#         ind_Ci[i] = 0
+#       }
+#     }
+#     
+#     # get G(t) estimate for all individuals for a given time t
+#     km_fit <- survfit(Surv(d.time, (1 - death)) ~ 1, data = data)
+#     
+#     G_ti <- summary(km_fit, times = min1)$surv # gives the KM estimate of the probability of survival (censored) for min(T_i, t)
+#     
+#     G_ti[G_ti == 0] <-
+#       0.0001 # add this line so that we don't get NaN when 0/0
+#     
+#     # get the ind_Ti for all individuals for a given time t
+#     ind_Ti <- rep(NA, nrow(data))
+#     
+#     for (i in 1:nrow(data)) {
+#       if (data$d.time[i] <= t) {
+#         ind_Ti[i] = 1
+#       } else {
+#         ind_Ti[i] = 0
+#       }
+#     }
+#     
+#     # get the F(t|x_i) for all individuals for a given time t (the probability of failure)
+#     F_ti <- pred
+#     
+#     # get a summed brier score over all individuals for a given time t
+#     BS_t <- sum((ind_Ci / G_ti) * ((ind_Ti - F_ti) ^ 2))
+#     
+#     # add that brier score t to a list
+#     BS_list[x] <- BS_t
+#     
+#   }
+#   return(BS_list)
+# }
+```
+
+```{r}
+# # unpen_cox brier score
+# pred <- predict(unpen_cox, newdata = as.data.frame(test_df), type = "expected")
+# pred <- 1 - exp(-pred)
+# Brier <- get_brier_scores(data = test_df, pred = pred)
+# times <- seq(from = 0, to  = max(test_df$d.time), length = length(test_df$d.time))
+# model <- rep("Unpenalized Cox", length(times))
+# unpen_cox_brier_df <- as.data.frame(cbind(model, times, Brier))[order(times),]
+# colnames(unpen_cox_brier_df) <- c("model", "times", "Brier")
+# rownames(unpen_cox_brier_df) <- NULL
+# unpen_cox_brier_df$model <- as.factor(unpen_cox_brier_df$model)
+# unpen_cox_brier_df$times <- as.double(unpen_cox_brier_df$times)
+# unpen_cox_brier_df$Brier <- as.double(unpen_cox_brier_df$Brier)
+# 
+# # lasso_pen_cox brier score
+# y_test_cox <- y_test[,c(2,1)]
+# colnames(y_test_cox) <- c("time", "status")
+# lasso_pen_cox_2 <- glmnet(x = x_train, y = y_train_2, family = "cox", alpha = 1, lambda = lasso_pen_cox$lambda.min) # here we specify the lambda to be the minimum lambda and refit the glmnet
+# lasso_pen_cox_3 <- coxph(Surv(time = d.time, event = death) ~ ., data = train_df, x = TRUE, init = c(as.matrix(coef(lasso_pen_cox_2))), iter.max = 0)# we refit the glmnet as a coxph (should be the same as cv.glmnet object fitted with min lambda)
+# # init is the initialized value for where the search begins to find the coef for the model
+# # iter.max says to just keep the initial values
+# pred <- predict(lasso_pen_cox_3, newdata = as.data.frame(test_df), type = "expected")
+# pred <- 1 - exp(-pred)
+# Brier <- get_brier_scores(data = test_df, pred = pred)
+# times <- seq(from = 0, to  = max(test_df$d.time), length = length(test_df$d.time))
+# model <- rep("Lasso Penalized Cox", length(times))
+# lasso_pen_cox_brier_df <- as.data.frame(cbind(model, times, Brier))[order(times),]
+# colnames(lasso_pen_cox_brier_df) <- c("model", "times", "Brier")
+# rownames(lasso_pen_cox_brier_df) <- NULL
+# lasso_pen_cox_brier_df$model <- as.factor(lasso_pen_cox_brier_df$model)
+# lasso_pen_cox_brier_df$times <- as.double(lasso_pen_cox_brier_df$times)
+# lasso_pen_cox_brier_df$Brier <- as.double(lasso_pen_cox_brier_df$Brier)
+# 
+# # ridge_pen_cox brier score
+# y_test_cox <- y_test[,c(2,1)]
+# colnames(y_test_cox) <- c("time", "status")
+# ridge_pen_cox_2 <- glmnet(x = x_train, y = y_train_2, family = "cox", alpha = 0, lambda = ridge_pen_cox$lambda.min)# here we specify the lambda to be the minimum lambda and refit the glmnet
+# ridge_pen_cox_3 <- coxph(Surv(time = d.time, event = death) ~ ., data = train_df, x = TRUE, init = c(as.matrix(coef(ridge_pen_cox_2))), iter.max = 0)# we refit the glmnet as a coxph (should be the same as cv.glmnet object fitted with min lambda)
+# # init is the initialized value for where the search begins to find the coef for the model
+# # iter.max says to just keep the initial values
+# pred <- predict(ridge_pen_cox_3, newdata = as.data.frame(test_df), type = "expected")
+# pred <- 1 - exp(-pred)
+# Brier <- get_brier_scores(data = test_df, pred = pred)
+# times <- seq(from = 0, to  = max(test_df$d.time), length = length(test_df$d.time))
+# model <- rep("Ridge Penalized Cox", length(times))
+# ridge_pen_cox_brier_df <- as.data.frame(cbind(model, times, Brier))[order(times),]
+# colnames(ridge_pen_cox_brier_df) <- c("model", "times", "Brier")
+# rownames(ridge_pen_cox_brier_df) <- NULL
+# ridge_pen_cox_brier_df$model <- as.factor(ridge_pen_cox_brier_df$model)
+# ridge_pen_cox_brier_df$times <- as.double(ridge_pen_cox_brier_df$times)
+# ridge_pen_cox_brier_df$Brier <- as.double(ridge_pen_cox_brier_df$Brier)
+# 
+# # lasso_pen_cb brier score
+# x_test_cb <- cbind(log(y_test[,"d.time"]), x_test) # solution: add log(d.time) as a first column to x_test
+# pred <- predict(lasso_pen_cb, newx = x_test_cb, type = "response", s = "lambda.min") # for each subject, this gives the probability that y=1 (death = 1), probability of failure
+# test_df_cb <- as.data.frame(cbind(y_test, x_test_cb))
+# colnames(test_df_cb)[3] <- "log(d.time)"
+# Brier <- get_brier_scores(data = test_df_cb, pred = pred)
+# times <- seq(from = 0, to  = max(test_df$d.time), length = length(test_df$d.time))
+# model <- rep("Lasso Penalized Casebase", length(times))
+# lasso_pen_cb_brier_df <- as.data.frame(cbind(model, times, Brier))[order(times),]
+# colnames(lasso_pen_cb_brier_df) <- c("model", "times", "Brier")
+# rownames(lasso_pen_cb_brier_df) <- NULL
+# lasso_pen_cb_brier_df$model <- as.factor(lasso_pen_cb_brier_df$model)
+# lasso_pen_cb_brier_df$times <- as.double(lasso_pen_cb_brier_df$times)
+# lasso_pen_cb_brier_df$Brier <- as.double(lasso_pen_cb_brier_df$Brier)
+# 
+# # ridge_pen_cb brier score
+# x_test_cb <- cbind(log(y_test[,"d.time"]), x_test) # solution: add log(d.time) as a first column to x_test
+# pred <- predict(ridge_pen_cb, newx = x_test_cb, type = "response", s = "lambda.min") # for each subject, this gives the probability that y=1 (death = 1), probability of failure
+# test_df_cb <- as.data.frame(cbind(y_test, x_test_cb))
+# colnames(test_df_cb)[3] <- "log(d.time)"
+# Brier <- get_brier_scores(data = test_df_cb, pred = pred)
+# times <- seq(from = 0, to  = max(test_df$d.time), length = length(test_df$d.time))
+# model <- rep("Ridge Penalized Casebase", length(times))
+# ridge_pen_cb_brier_df <- as.data.frame(cbind(model, times, Brier))[order(times),]
+# colnames(ridge_pen_cb_brier_df) <- c("model", "times", "Brier")
+# rownames(ridge_pen_cb_brier_df) <- NULL
+# ridge_pen_cb_brier_df$model <- as.factor(ridge_pen_cb_brier_df$model)
+# ridge_pen_cb_brier_df$times <- as.double(ridge_pen_cb_brier_df$times)
+# ridge_pen_cb_brier_df$Brier <- as.double(ridge_pen_cb_brier_df$Brier)
+# 
+# # combine brier scores
+# brier_df <- rbind(unpen_cox_brier_df, lasso_pen_cox_brier_df, ridge_pen_cox_brier_df, lasso_pen_cb_brier_df, ridge_pen_cb_brier_df) %>% 
+#   mutate(model = factor(model, levels = c("Unpenalized Cox", "Lasso Penalized Cox", "Ridge Penalized Cox", "Lasso Penalized Casebase", "Ridge Penalized Casebase")))
+# 
+# # detect outliers
+# detect_outlier = function(x) {
+#  
+#     # calculate first quantile
+#     Quantile1 <- quantile(x, probs=.25)
+#  
+#     # calculate third quantile
+#     Quantile3 <- quantile(x, probs=.75)
+#  
+#     # calculate inter quartile range
+#     IQR = Quantile3-Quantile1
+#  
+#     # return true or false
+#     x > Quantile3 + (IQR*1.5) | x < Quantile1 - (IQR*1.5)
+# }
+# 
+# # subset non-outliers into brier_df
+# brier_df <- brier_df[which(!detect_outlier(brier_df$Brier)),]
+# 
+# # plot brier scores
+# ggplot(data = brier_df, aes(x = times, y = Brier, col = model))+
+#   geom_line() +
+#   xlab("Time") +
+#   ylab("Brier Score") +
+#   labs(color = "Method", title = "Time-Dependent Brier Scores")
+# 
+# ## testing logistic regression prob(y=1) formula
+# # predict(lasso_pen_cb, newx = x_test_cb[1,], type = "response", s = "lambda.min") # this is prob of y=1
+# # b_0 = coefficients(lasso_pen_cb, s = "lambda.min")[1]
+# # x_i = as.vector(x_test_cb[1,])
+# # betas = as.vector(coefficients(lasso_pen_cb, s = "lambda.min"))[-c(1)]
+# # (exp(b_0 + betas%*%x_i)/(1 + exp(b_0 + betas%*%x_i))) # this is prob of y=1 for logistic regression
+# # 1/(1 + exp(-(b_0+x_i%*%betas))) # this is also prob of y=1 for logistic regression but simplified
+```
+
+```{r}
+# Absolute Risks
+newx <- model.matrix(death ~ . - d.time,
+                     data = test_df)[, -c(1)] # get all x covariate values from test dataset
+times <- sort(unique(test_df$d.time)) # get all unique survival times (d.time) and sort in ascending order
+
+# 1. Unpenalized Cox
+ab_unpen_cox <- survival::survfit(unpen_cox, newdata = test_df)
+
+
+# 2. Lasso Penalized Cox
+y_test_cox <- y_test[,c(2,1)]
+colnames(y_test_cox) <- c("time", "status")
+lasso_pen_cox_2 <- glmnet(x = x_train, y = y_train_2, family = "cox", alpha = 1, lambda = lasso_pen_cox$lambda.min) # here we specify the lambda to be the minimum lambda and refit the glmnet
+nonzero_covariate_lasso_cox <- predict(lasso_pen_cox_2, type = "nonzero", s = "lambda.min") # get the columns of the non-zero selected covariates
+nonzero_coef_cox <- coef(lasso_pen_cox_2)
+# creating a new dataset containing the chosen covariates with predict nonzero
+cleanCoxData <- as.data.frame(cbind(y_train, x_train[,nonzero_covariate_lasso_cox[,1]]))
+
+lasso_pen_cox_4 <- coxph(Surv(time = d.time, event = death) ~ ., data = cleanCoxData, x = TRUE)# we refit the glmnet as a coxph using the "cleaned" data which includes only nonzero selected beta columns from lasso cox
+
+newdata_lasso_pen_cox <- as.data.frame(newx[, nonzero_covariate_lasso_cox[,1]])
+colnames(newdata_lasso_pen_cox) <- colnames(cleanCoxData)[-c(1,2)]
+
+ab_lasso_cox <- survival::survfit(lasso_pen_cox_4, type = "breslow", 
+                              newdata = newdata_lasso_pen_cox)
+
+# 3. Ridge Penalized Cox
+y_test_cox <- y_test[,c(2,1)]
+colnames(y_test_cox) <- c("time", "status")
+ridge_pen_cox_2 <- glmnet(x = x_train, y = y_train_2, family = "cox", alpha = 0, lambda = ridge_pen_cox$lambda.min)# here we specify the lambda to be the minimum lambda and refit the glmnet
+ridge_pen_cox_3 <- coxph(Surv(time = d.time, event = death) ~ ., data = train_df, x = TRUE, init = c(as.matrix(coef(ridge_pen_cox_2))), iter.max = 0)# we refit the glmnet as a coxph (should be the same as cv.glmnet object fitted with min lambda)
+
+ab_ridge_cox <- survival::survfit(ridge_pen_cox_3, type = "breslow", 
+                              newdata = as.data.frame(newx))
+
+# 4. Lasso Penalized Case-base
+ab_lasso_pen_cb <- casebase::absoluteRisk(lasso_pen_cb,
+  time = times,
+  newdata = newx,
+  s = "lambda.1se",
+  method = "numerical"
+)
+
+# 5. Ridge Penalized Case-base
+ab_ridge_pen_cb <- casebase::absoluteRisk(ridge_pen_cb,
+  time = times,
+  newdata = newx,
+  s = "lambda.1se",
+  method = "numerical"
+)
+
+# option to filter some observations to make it more stepwise for Cox (didn't use this)
+cox_ind <- seq(from = 1, to = length(ab_unpen_cox$time), 1)
+
+# Combine absolute risk estimates
+# for each time t, take the average of probs for each individual (1 minus for the prob of failure)
+data_absRisk <- bind_rows(
+  data.frame(Time = ab_unpen_cox$time[cox_ind], Prob = 1 - rowMeans(ab_unpen_cox$surv[cox_ind,]),
+             Model = "Unpenalized Cox"),
+  data.frame(Time = ab_lasso_cox$time[cox_ind], Prob = 1 - rowMeans(ab_lasso_cox$surv[cox_ind,]),
+             Model = "Lasso Penalized Cox"),
+    data.frame(Time = ab_ridge_cox$time[cox_ind], Prob = 1 - rowMeans(ab_ridge_cox$surv[cox_ind,]),
+             Model = "Ridge Penalized Cox"),
+  data.frame(Time = ab_lasso_pen_cb[, 1], Prob = rowMeans(ab_lasso_pen_cb[, -c(1)]),
+             Model = "Lasso Penalized Casebase"),
+  data.frame(Time = ab_ridge_pen_cb[, 1], Prob = rowMeans(ab_ridge_pen_cb[, -c(1)]),
+             Model = "Ridge Penalized Casebase")
+)
+
+############ testing work CI
+# ab_unpen_cox$time %>% length()
+# ab_lasso_pen_cb[, 1] %>% length()
+# 
+# rowMeans(ab_unpen_cox$surv) %>% length()
+# rowMeans(ab_lasso_pen_cb[, -c(1)]) %>% length()
+# 
+# data_absRisk %>% filter(Model == "Lasso Penalized Casebase") %>% select(c("Prob")) %>% unique()
+# data_absRisk %>% filter(Model == "Lasso Penalized Cox") %>% select(c("Prob")) %>% unique()
+# 
+# data_absRisk
+```
+
+```{r absRiskPlot, echo=FALSE, eval=eval_cs3}
+# helper functions scale
+scaleFUNy <- function(x) sprintf("%.2f", x)
+scaleFUNx <- function(x) sprintf("%.0f", x)
+
+# detect outliers
+# detect_outlier = function(x) {
+# 
+#     # calculate first quantile
+#     Quantile1 <- quantile(x, probs=.25)
+# 
+#     # calculate third quantile
+#     Quantile3 <- quantile(x, probs=.75)
+# 
+#     # calculate inter quartile range
+#     IQR = Quantile3-Quantile1
+# 
+#     # return true or false
+#     x > Quantile3 + (IQR*1.5) | x < Quantile1 - (IQR*1.5)
+# }
+
+# subset non-outliers into brier_df
+# data_absRisk <- data_absRisk[which(!detect_outlier(data_absRisk$Time)),]
+
+reg_ci <- ggplot(data_absRisk, aes(Time, Prob)) +
+  geom_line(aes(colour = Model)) +
+  labs(y = "Probability of failure", x = "Time", color = "Method", title = "Cumulative Incidence Curves") +
+  expand_limits(y = 1) +
+  scale_y_continuous(labels = scaleFUNy, n.breaks = 9) +
+  xlim(c(0,max(filter(data_absRisk, Model == "Lasso Penalized Casebase")$Time))) # set a limit here because there can be some outlier times
+
+reg_ci
+```
+
+
+```{r}
+# get Brier Score (my method)
+
+# get_brier_scores function
+get_brier_scores <- function(data, pred, times) {
+
+  # for each time t, we want a single brier score, summed of the individuals
+  BS_list <- rep(NA, length(times))
+  
+  for (x in 1:length(times)) {
+    t <- times[x]
+    
+    # get the min(d.time, t) of all individuals for a given time t
+    min1 <- sapply(
+      X = data$d.time,
+      FUN = function(x) {
+        min(x, t)
+      }
+    )
+    
+    # get the ind_Ci for all individuals for a given time t
+    ind_Ci <- rep(NA, nrow(data)) # initialize empty vector
+    
+    for (i in 1:nrow(data)) {
+      if ((data$death[i] == 0 & (data$d.time[i] < t)) | (data$death[i] == 1)) {
+        ind_Ci[i] = 1
+      } else {
+        ind_Ci[i] = 0
+      }
+    }
+    
+    # get G(t) estimate for all individuals for a given min(t, T_i)
+    km_fit <- survfit(Surv(d.time, (1 - death)) ~ 1, data = data)
+    
+    G_ti <- summary(km_fit, times = min1)$surv # gives the KM estimate of the probability of survival (censored) for min(T_i, t)
+    
+    G_ti[G_ti == 0] <-
+      0.0001 # add this line so that we don't get NaN when 0/0
+    
+    # get the ind_Ti for all individuals for a given time t
+    ind_Ti <- rep(NA, nrow(data))
+    
+    for (i in 1:nrow(data)) {
+      if (data$d.time[i] <= t) {
+        ind_Ti[i] = 1
+      } else {
+        ind_Ti[i] = 0
+      }
+    }
+
+    # get the F(t|x_i) for all individuals for a given time t (the probability of failure)
+    F_ti <- pred[x,]
+
+    # get a summed brier score over all individuals for a given time t
+    BS_t <- sum((ind_Ci / G_ti) * ((ind_Ti - F_ti) ^ 2))
+
+    # add that brier score t to a list
+    BS_list[x] <- BS_t
+    
+  }
+  return(BS_list)
+}
+```
+
+
+
+```{r}
+# unpen_cox brier score
+Brier <- get_brier_scores(data = test_df, pred = (1 - ab_unpen_cox$surv), times = ab_unpen_cox$time)
+times <- ab_unpen_cox$time
+model <- rep("Unpenalized Cox", length(times))
+unpen_cox_brier_df <- as.data.frame(cbind(model, times, Brier))[order(times),]
+colnames(unpen_cox_brier_df) <- c("model", "times", "Brier")
+rownames(unpen_cox_brier_df) <- NULL
+unpen_cox_brier_df$model <- as.factor(unpen_cox_brier_df$model)
+unpen_cox_brier_df$times <- as.double(unpen_cox_brier_df$times)
+unpen_cox_brier_df$Brier <- as.double(unpen_cox_brier_df$Brier)
+
+# lasso_pen_cox brier score
+Brier <- get_brier_scores(data = test_df, pred = (1 - ab_lasso_cox$surv), times = ab_lasso_cox$time)
+times <- ab_lasso_cox$time
+model <- rep("Lasso Penalized Cox", length(times))
+lasso_pen_cox_brier_df <- as.data.frame(cbind(model, times, Brier))[order(times),]
+colnames(lasso_pen_cox_brier_df) <- c("model", "times", "Brier")
+rownames(lasso_pen_cox_brier_df) <- NULL
+lasso_pen_cox_brier_df$model <- as.factor(lasso_pen_cox_brier_df$model)
+lasso_pen_cox_brier_df$times <- as.double(lasso_pen_cox_brier_df$times)
+lasso_pen_cox_brier_df$Brier <- as.double(lasso_pen_cox_brier_df$Brier)
+
+# ridge_pen_cox brier score
+Brier <- get_brier_scores(data = test_df, pred = (1 - ab_ridge_cox$surv), times = ab_lasso_cox$time)
+times <- ab_lasso_cox$time
+model <- rep("Ridge Penalized Cox", length(times))
+ridge_pen_cox_brier_df <- as.data.frame(cbind(model, times, Brier))[order(times),]
+colnames(ridge_pen_cox_brier_df) <- c("model", "times", "Brier")
+rownames(ridge_pen_cox_brier_df) <- NULL
+ridge_pen_cox_brier_df$model <- as.factor(ridge_pen_cox_brier_df$model)
+ridge_pen_cox_brier_df$times <- as.double(ridge_pen_cox_brier_df$times)
+ridge_pen_cox_brier_df$Brier <- as.double(ridge_pen_cox_brier_df$Brier)
+
+# lasso_pen_cb brier score
+x_test_cb <- cbind(log(y_test[,"d.time"]), x_test) # solution: add log(d.time) as a first column to x_test
+test_df_cb <- as.data.frame(cbind(y_test, x_test_cb))
+colnames(test_df_cb)[3] <- "log(d.time)"
+Brier <- get_brier_scores(data = test_df_cb, pred = ab_lasso_pen_cb[, -c(1)], times = ab_lasso_pen_cb[, 1])
+times <- ab_lasso_pen_cb[, 1]
+model <- rep("Lasso Penalized Casebase", length(times))
+lasso_pen_cb_brier_df <- as.data.frame(cbind(model, times, Brier))[order(times),]
+colnames(lasso_pen_cb_brier_df) <- c("model", "times", "Brier")
+rownames(lasso_pen_cb_brier_df) <- NULL
+lasso_pen_cb_brier_df$model <- as.factor(lasso_pen_cb_brier_df$model)
+lasso_pen_cb_brier_df$times <- as.double(lasso_pen_cb_brier_df$times)
+lasso_pen_cb_brier_df$Brier <- as.double(lasso_pen_cb_brier_df$Brier)
+
+# ridge_pen_cb brier score
+x_test_cb <- cbind(log(y_test[,"d.time"]), x_test) # solution: add log(d.time) as a first column to x_test
+test_df_cb <- as.data.frame(cbind(y_test, x_test_cb))
+colnames(test_df_cb)[3] <- "log(d.time)"
+Brier <- get_brier_scores(data = test_df_cb, pred = ab_ridge_pen_cb[, -c(1)], times = ab_ridge_pen_cb[,1])
+times <- ab_ridge_pen_cb[,1]
+model <- rep("Ridge Penalized Casebase", length(times))
+ridge_pen_cb_brier_df <- as.data.frame(cbind(model, times, Brier))[order(times),]
+colnames(ridge_pen_cb_brier_df) <- c("model", "times", "Brier")
+rownames(ridge_pen_cb_brier_df) <- NULL
+ridge_pen_cb_brier_df$model <- as.factor(ridge_pen_cb_brier_df$model)
+ridge_pen_cb_brier_df$times <- as.double(ridge_pen_cb_brier_df$times)
+ridge_pen_cb_brier_df$Brier <- as.double(ridge_pen_cb_brier_df$Brier)
+
+
+# combine brier scores
+brier_df <- rbind(unpen_cox_brier_df, lasso_pen_cox_brier_df, ridge_pen_cox_brier_df, lasso_pen_cb_brier_df, ridge_pen_cb_brier_df) %>% 
+  mutate(model = factor(model, levels = c("Unpenalized Cox", "Lasso Penalized Cox", "Ridge Penalized Cox", "Lasso Penalized Casebase", "Ridge Penalized Casebase")))
+
+# detect outliers
+detect_outlier = function(x) {
+ 
+    # calculate first quantile
+    Quantile1 <- quantile(x, probs=.25)
+ 
+    # calculate third quantile
+    Quantile3 <- quantile(x, probs=.75)
+ 
+    # calculate inter quartile range
+    IQR = Quantile3-Quantile1
+ 
+    # return true or false
+    x > Quantile3 + (IQR*1.5) | x < Quantile1 - (IQR*1.5)
+}
+
+# subset non-outliers into brier_df
+brier_df <- brier_df[which(!detect_outlier(brier_df$Brier)),]
+
+# plot brier scores
+ggplot(data = brier_df, aes(x = times, y = Brier, col = model))+
+  geom_line() +
+  xlab("Time") +
+  ylab("Brier Score") +
+  labs(color = "Method", title = "Time-Dependent Brier Scores") +
+  xlim(c(0,max(filter(brier_df, model == "Ridge Penalized Casebase")$times))) # set a limit here because there can be some outlier times
+```
+
+```{r}
+# ########### get brier score from riskregression
+# # brierCoxKM <- Score(list("Cox" = cox,
+# #                          "K-M" = KM), data = test,
+# #                    formula = Hist(d.time, death != 0) ~ 1, summary = NULL,
+# #                    se.fit = FALSE, metrics = "brier", contrasts = FALSE,
+# #                    times = times)
+# # # 2. Penalized models
+# # brierPenalized <- Score(list("Pen. Cox" = coxNet,
+# #                              "Pen. CB" = pen_cb),
+# #                         data = cbind(subset(test, select = c(d.time, death)),
+# #                                      as.data.frame(newx)),
+# #                         formula = Hist(d.time, death != 0) ~ 1, summary = NULL,
+# #                         se.fit = FALSE, metrics = "brier", contrasts = FALSE,
+# #                         times = times)
+# 
+# times <- sort(unique(test_df$d.time))
+# 
+# brier_unpen_cox <- Score(list("Unpenalized Cox" = unpen_cox), data = as.data.frame(test_df),
+#      formula = Hist(d.time, death != 0) ~ 1, summary = NULL,
+#      se.fit = FALSE, metrics = "brier", contrasts = FALSE,
+#      times = times)
+# 
+# brier_lasso_cox <- Score(list("Lasso Cox" = lasso_pen_cox_4), data = as.data.frame(test_df),
+#      formula = Hist(d.time, death != 0) ~ 1, summary = NULL,
+#      se.fit = FALSE, metrics = "brier", contrasts = FALSE,
+#      times = times)
+# 
+# brier_ridge_cox <- Score(list("Ridge Cox" = ridge_pen_cox_3), data = as.data.frame(test_df),
+#      formula = Hist(d.time, death != 0) ~ 1, summary = NULL,
+#      se.fit = FALSE, metrics = "brier", contrasts = FALSE,
+#      times = times)
+# 
+# brier_lasso_cb <- Score(list("Lasso Casebase" = lasso_pen_cb), data = as.data.frame(test_df),
+#      formula = Hist(d.time, death != 0) ~ 1, summary = NULL,
+#      se.fit = FALSE, metrics = "brier", contrasts = FALSE,
+#      times = times)
+# 
+# brier_ridge_cb <- Score(list("Ridge Casebase" = ridge_pen_cb), data = as.data.frame(test_df),
+#      formula = Hist(d.time, death != 0) ~ 1, summary = NULL,
+#      se.fit = FALSE, metrics = "brier", contrasts = FALSE,
+#      times = times)
+# 
+# 
+# # Combine scores
+# data_brier <- bind_rows(
+#   brier_unpen_cox$Brier$score %>% 
+#     mutate(model = as.character(model)) %>% 
+#     filter(model != "Null model"),
+#   
+#     brier_lasso_cox$Brier$score %>% 
+#     mutate(model = as.character(model)) %>% 
+#     filter(model != "Null model"),
+#   
+#     brier_ridge_cox$Brier$score %>% 
+#     mutate(model = as.character(model)) %>% 
+#     filter(model != "Null model"),
+#   
+#     brier_lasso_cb$Brier$score %>% 
+#     mutate(model = as.character(model)) %>% 
+#     filter(model != "Null model"),
+#   
+#     brier_ridge_cb$Brier$score %>% 
+#     mutate(model = as.character(model)) %>% 
+#     filter(model != "Null model")
+#   ) %>% 
+#   mutate(model = factor(model, levels = c("Unpenalized Cox", "Lasso Cox", "Ridge Cox", "Lasso Casebase", "Ridge Casebase")))
+# 
+# # remove na's
+# data_brier <- na.omit(data_brier)
+# 
+# # detect outliers
+# detect_outlier = function(x) {
+#  
+#     # calculate first quantile
+#     Quantile1 <- quantile(x, probs=.25)
+#  
+#     # calculate third quantile
+#     Quantile3 <- quantile(x, probs=.75)
+#  
+#     # calculate inter quartile range
+#     IQR = Quantile3-Quantile1
+#  
+#     # return true or false
+#     x > Quantile3 + (IQR*1.5) | x < Quantile1 - (IQR*1.5)
+# }
+# 
+# # subset non-outliers into brier_df
+# data_brier <- data_brier[which(!detect_outlier(data_brier$times)),]
+# 
+# reg_brier <- ggplot(data = data_brier, aes(x = times, y = Brier, col = model)) +
+#   geom_line() +
+#   xlab("Time") +
+#   ylab("Brier Score") +
+#   labs(color = "Method", title = "Time-Dependent Brier Scores") +
+#   scale_x_continuous(labels = scaleFUNx, 
+#                      breaks = round(seq(0, 5, by = 1))) + 
+#   scale_y_continuous(labels = scaleFUNy, n.breaks = 8)
+# reg_brier
+```
+
+## PT Graphs
+
+```{r}
+pt_df <- df[which(!detect_outlier(df$d.time)),]
+pt_object <- popTime(data = pt_df, event = "death", time = "d.time")
+plot(pt_object, xlab = "Time", add.case.series = FALSE)
+
+```
+
+
+```{r}
+plot(pt_object, xlab = "Time", )
+
+
+```
+
+```{r}
+plot(pt_object,
+     add.case.series = TRUE,
+     add.base.series = TRUE,
+     comprisk = FALSE,
+     xlab = "Time")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+

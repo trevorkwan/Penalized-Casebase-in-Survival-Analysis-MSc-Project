@@ -1,0 +1,149 @@
+---
+title: "elastic_net_paper_simulation"
+author: "Trevor Kwan"
+date: "05/03/2022"
+output: pdf_document
+---
+
+```{r}
+# load libraries
+library(glmnet)
+library(tidyverse)
+library(survival)
+```
+
+## Example 1
+
+```{r}
+set.seed(123)
+
+# generate x matrix
+x_mat <- rnorm(n = 3*40, mean = 0, sd = 0.9) %>% matrix(nrow = 40)
+
+x_mat[1,1] <- rnorm(n = 1, mean = 0, sd = 1)
+x_mat[2,2] <- rnorm(n = 1, mean = 0, sd = 1)
+x_mat[3,3] <- rnorm(n = 1, mean = 0, sd = 1)
+
+x_mat <- x_mat %>% t()
+
+# generate betas
+beta <- c(2, -2, 2.5)
+
+# generate hazards
+h_0 <- 1
+
+h_mat <- h_0*exp(t(x_mat)%*%beta)
+
+# generate censoring times
+cen_mat <- runif(n = 40, min = 0, max = 8) %>% matrix(nrow = 40)
+
+# generate survival times
+surv_mat <- - (log(runif(n = 40, 0, 1))) / (exp(t(x_mat)%*%beta))
+
+# generate censoring indicator based on survival times
+d_mat <- ifelse(surv_mat <= cen_mat, yes = 0, no = 1)
+
+# check if censoring rate is same as paper
+sum(d_mat)/40
+```
+
+
+```{r}
+# create survival time and censoring indicator
+# get minimum of t_i and c_i
+y_mat <- cbind(surv_mat, cen_mat) # treating hazards as the lifetimes, t_i
+y <- apply(y_mat, MARGIN = 1, FUN = min)
+y <- cbind(y, d_mat)
+colnames(y) <- c("time", "status")
+
+# create covariates matrix
+x <- t(x_mat)
+
+fit <- glmnet(x, y, family = "cox", alpha = 1)
+
+plot(fit)
+```
+
+```{r}
+# create survival time and censoring indicator
+# treating censoring times as the lifetimes, t_i
+y <- cbind(cen_mat, d_mat)
+colnames(y) <- c("time", "status")
+
+# create covariates matrix
+x <- t(x_mat)
+
+fit <- glmnet(x, y, family = "cox", alpha = 1)
+
+plot(fit)
+```
+
+## Example 2
+
+```{r}
+# generate data
+set.seed(123)
+# generate x_mat
+x_mat <- rnorm(n = 200*12, 0, 0.3) %>% matrix(nrow = 200)
+
+for (i in 1:nrow(x_mat))
+{
+  for (k in 1:ncol(x_mat))
+  {
+    if (i == k) {x_mat[i,k] <- rnorm(n = 1, 0, 1)}
+    else if ((k == 12) & (i>=1) & (i<=11)) {x_mat[i,k] <-rnorm(n=1, 0, abs((-0.18)^(i+1)))}
+    else if ((i == 12) & (k>=1) & (k<=11)) {x_mat[i,k] <- rnorm(n=1, 0, abs((-0.18)^(k+1)))}
+  }
+}
+x_mat <- x_mat %>% t()
+
+# generate true betas
+beta <- c(-0.8, 1.6, -0.8, 1, 0, 1.5, -1.2, 3, 0, 0, 0, 0.5)
+
+# generate lifetimes (hazards)
+h_0 <- 1 # h_0(y) = 1
+h_mat <- h_0*exp(t(x_mat)%*%beta)
+
+# generate censoring times
+cen_mat <- runif(n = 200, min = 0, max = 10)
+
+# generate censoring indicator
+d_mat <- ifelse(h_mat <= cen_mat, yes = 0, no = 1)
+```
+
+```{r}
+# create survival time and censoring indicator
+# get minimum of t_i and c_i
+y_mat <- cbind(h_mat, cen_mat) # treating hazards as the lifetimes, t_i
+y <- apply(y_mat, MARGIN = 1, FUN = min)
+y <- cbind(y, d_mat)
+colnames(y) <- c("time", "status")
+
+# create covariates matrix
+x <- t(x_mat)
+
+fit <- glmnet(x, y, family = "cox", alpha = 1)
+
+plot(fit)
+```
+
+```{r}
+# create survival time and censoring indicator
+# get minimum of t_i and c_i
+y_mat <- cbind(h_mat, cen_mat) # treating hazards as the lifetimes, t_i
+y <- apply(y_mat, MARGIN = 1, FUN = min)
+y <- cbind(y, d_mat)
+colnames(y) <- c("time", "status")
+
+# create covariates matrix
+x <- t(x_mat)
+
+fit <- glmnet(x, y, family = "cox", alpha = 1)
+
+plot(fit)
+```
+
+
+
+
+
