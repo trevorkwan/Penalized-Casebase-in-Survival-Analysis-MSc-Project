@@ -1,4 +1,4 @@
-# Penalized Casebase in Survival Analysis MSc in Statistics Project
+# Penalized Casebase in Survival Analysis (MSc in Statistics Final Project)
 
 ## Summary
 
